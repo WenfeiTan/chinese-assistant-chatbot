@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 from collections import Counter
 from pathlib import Path
@@ -13,7 +12,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from app.db import DB_PATH, get_connection
 from app.model_client import get_embedding_model, get_embedding_provider
-from app.rag_index import build_indexes, search_index
+from app.rag_index import build_indexes, search_index, visible_proxy_env_names
 
 
 DEFAULT_QUERIES = [
@@ -100,23 +99,17 @@ def main() -> None:
     parser.add_argument("--quiet", action="store_true", help="Only print summaries and final search results.")
     parser.add_argument("--top-k", type=int, default=3, help="Top-k results per index.")
     parser.add_argument("--query", action="append", help="Query to verify. Can be passed multiple times.")
-    parser.add_argument(
-        "--mock-embeddings",
-        action="store_true",
-        help="Use deterministic local embeddings for structure and cache verification.",
-    )
     args = parser.parse_args()
-
-    if args.mock_embeddings:
-        os.environ["MOCK_EMBEDDINGS"] = "1"
 
     print(
         "VERIFY RAG INDEX\n"
         f"provider={get_embedding_provider()} model={get_embedding_model()} "
-        f"force={args.force} mock_arg={args.mock_embeddings} "
-        f"env_MOCK_EMBEDDINGS={os.getenv('MOCK_EMBEDDINGS', '') or '<unset>'}",
+        f"force={args.force}",
         flush=True,
     )
+    proxy_names = visible_proxy_env_names()
+    if proxy_names:
+        print(f"Proxy env detected: {', '.join(proxy_names)}", flush=True)
 
     result = build_indexes(force=args.force, log_progress=not args.quiet)
     print("BUILD SUMMARY")

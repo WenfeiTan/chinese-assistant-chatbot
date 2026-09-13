@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import hashlib
+import html
 import json
 import math
+import os
 import re
 import sqlite3
+import time
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 from app.db import BASE_DIR, get_connection, init_db, utc_now
 from app.model_client import embed_texts, get_embedding_model, get_embedding_provider
@@ -22,7 +25,7 @@ TEACHING_FILES = [
 LEVEL_FILES = [
     KB_DIR / "水平表" / "HSK4词汇.md",
     KB_DIR / "水平表" / "HSK5词汇.md",
-    KB_DIR / "水平表" / "HSK语法1-6.md",
+    KB_DIR / "水平表" / "HSK语法1-5.md",
 ]
 
 ARTICLE_RE = re.compile(r"^#\s*(文章[一二三四五六七八九十]+)\s*(.+)?\s*$")
@@ -35,7 +38,8 @@ OPTION_RE = re.compile(r"^([A-H])[.．、]\s*(.*)")
 INLINE_OPTION_RE = re.compile(r"([A-H])[.．、]?([^A-H]+?)(?=(?:[A-H][.．、]?)|$)")
 ANSWER_RE = re.compile(r"(\d+)[.．、]\s*([^0-9]+?)(?=\s+\d+[.．、]|$)")
 ARTICLE_NUMERALS = "一二三四五六七八九十"
-DEFAULT_EMBED_BATCH_SIZE = 64
+DEFAULT_EMBED_BATCH_SIZE = 16
+MAX_EMBED_RETRIES = 3
 
 
 @dataclass(frozen=True)
@@ -64,6 +68,13 @@ class Chunk:
             sort_keys=True,
         )
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True)
+class VocabularyItem:
+    item_no: int
+    term: str
+    content: str
 
 
 def relative_source(path: Path) -> str:
@@ -434,53 +445,142 @@ def parse_level_markdown(path: Path) -> list[Chunk]:
     text = path.read_text(encoding="utf-8")
     chunks: list[Chunk] = []
     if "词汇" in source_file:
-        blocks = re.split(r"\n(?=\d+\s*(?:【|\S+\s+[a-zāáǎàēéěèīíǐìōóǒòūúǔùǖǘǚǜü]))", text)
-        seen_item_numbers: Counter[int] = Counter()
-        for block in blocks:
-            block = block.strip()
-            bracket_match = re.match(r"^(\d+)\s*【([^】]+)】", block)
-            plain_match = re.match(r"^(\d+)\s+(\S+)\s+", block)
-            match = bracket_match or plain_match
-            if not match:
+        vocabulary_items = parse_vocabulary_items(text)
+        group_size = 15 if "HSK4" in source_file else 8
+        level = "HSK4" if "HSK4" in source_file else "HSK5"
+        for group_no, start in enumerate(range(0, len(vocabulary_items), group_size), start=1):
+            group = vocabulary_items[start : start + group_size]
+            if not group:
                 continue
-            item_no = int(match.group(1))
-            seen_item_numbers[item_no] += 1
-            term = match.group(2).strip()
-            occurrence = seen_item_numbers[item_no]
-            occurrence_suffix = f"_{occurrence:02d}" if occurrence > 1 else ""
-            chunk_id = f"{source_file.removesuffix('.md')}_vocab_{item_no:04d}{occurrence_suffix}"
+            first_no = group[0].item_no
+            last_no = group[-1].item_no
+            terms = [item.term for item in group]
+            chunk_id = f"{source_file.removesuffix('.md')}_vocab_group_{group_no:03d}"
+            heading = f"{level}词汇 {first_no}-{last_no}"
+            content = "\n\n".join(item.content for item in group)
             metadata = {
                 "id": chunk_id,
                 "index_name": "level_index",
                 "source": source,
                 "source_file": source_file,
-                "chunk_type": "vocabulary",
-                "item_no": item_no,
-                "term": term,
-                "level": "HSK4" if "HSK4" in source_file else "HSK5",
+                "chunk_type": "vocabulary_group",
+                "item_no_start": first_no,
+                "item_no_end": last_no,
+                "group_no": group_no,
+                "group_size": len(group),
+                "terms": terms,
+                "level": level,
             }
-            chunks.append(Chunk(chunk_id, "level_index", source, source_file, "vocabulary", term, block, metadata))
+            chunks.append(Chunk(chunk_id, "level_index", source, source_file, "vocabulary_group", heading, content, metadata))
         return chunks
 
     tables = re.findall(r"<table>.*?</table>", text, flags=re.S)
-    for item_no, table in enumerate(tables, start=1):
-        plain = re.sub(r"</t[dh]>\s*<t[dh][^>]*>", " | ", table)
-        plain = re.sub(r"<[^>]+>", "", plain)
-        plain = re.sub(r"\s+", " ", plain).strip()
-        level_match = re.search(r"([一二三四五六]级)语法项目表", plain)
-        level = level_match.group(1) if level_match else None
-        chunk_id = f"HSK语法1-6_grammar_{item_no:03d}"
-        metadata = {
-            "id": chunk_id,
-            "index_name": "level_index",
-            "source": source,
-            "source_file": source_file,
-            "chunk_type": "grammar",
-            "item_no": item_no,
-            "level": level,
-        }
-        chunks.append(Chunk(chunk_id, "level_index", source, source_file, "grammar", level, plain, metadata))
+    grammar_item_no = 0
+    for table_no, table in enumerate(tables, start=1):
+        rows = extract_html_table_rows(table)
+        table_text = " ".join(" | ".join(row) for row in rows)
+        level_match = re.search(r"([一二三四五六]级)语法项目表", table_text)
+        level = level_match.group(1) if level_match else f"table_{table_no:02d}"
+        for row_no, cells in enumerate(rows, start=1):
+            grammar_item = grammar_item_from_cells(cells)
+            if not grammar_item:
+                continue
+            grammar_item_no += 1
+            chunk_id = f"{source_file.removesuffix('.md')}_grammar_{grammar_item_no:03d}"
+            title = grammar_item["title"]
+            content = (
+                f"等级：{level}\n"
+                f"语法点：{title}\n"
+                f"结构：{grammar_item['structure']}\n"
+                f"例句：{grammar_item['example']}"
+            )
+            metadata = {
+                "id": chunk_id,
+                "index_name": "level_index",
+                "source": source,
+                "source_file": source_file,
+                "chunk_type": "grammar",
+                "item_no": grammar_item_no,
+                "table_no": table_no,
+                "row_no": row_no,
+                "level": level,
+                "grammar_point": title,
+            }
+            chunks.append(Chunk(chunk_id, "level_index", source, source_file, "grammar", title, content, metadata))
     return chunks
+
+
+def split_vocabulary_blocks(text: str) -> list[str]:
+    normalized = re.sub(r"(?<!\d)(\d+)(?=【)", r"\n\1 ", text)
+    normalized = re.sub(r"(?m)^(#+\s*)?(\d+)(?=【)", r"\1\2 ", normalized)
+    pattern = re.compile(r"(?m)^(?:#+\s*)?\d+\s*(?:【[^\n】]+】|[^\s【】]+\s+)")
+    matches = list(pattern.finditer(normalized))
+    blocks: list[str] = []
+    for index, match in enumerate(matches):
+        start = match.start()
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(normalized)
+        block = normalized[start:end].strip()
+        if block:
+            blocks.append(block)
+    return blocks
+
+
+def parse_vocabulary_items(text: str) -> list[VocabularyItem]:
+    items: list[VocabularyItem] = []
+    seen_item_numbers: Counter[int] = Counter()
+    for block in split_vocabulary_blocks(text):
+        block = block.strip()
+        bracket_match = re.match(r"^(?:#+\s*)?(\d+)\s*【([^】]+)】", block)
+        plain_match = re.match(r"^(?:#+\s*)?(\d+)\s+([^\s【】]+)\s+", block)
+        match = bracket_match or plain_match
+        if not match:
+            continue
+        item_no = int(match.group(1))
+        seen_item_numbers[item_no] += 1
+        term = match.group(2).strip()
+        items.append(VocabularyItem(item_no=item_no, term=term, content=block))
+    return items
+
+
+def extract_html_table_rows(table: str) -> list[list[str]]:
+    rows: list[list[str]] = []
+    for row_html in re.findall(r"<tr[^>]*>(.*?)</tr>", table, flags=re.S):
+        cells = []
+        for cell_html in re.findall(r"<t[dh][^>]*>(.*?)</t[dh]>", row_html, flags=re.S):
+            plain = re.sub(r"<[^>]+>", "", cell_html)
+            plain = html.unescape(plain)
+            plain = re.sub(r"\s+", " ", plain).strip()
+            if plain:
+                cells.append(plain)
+        if cells:
+            rows.append(cells)
+    return rows
+
+
+def grammar_item_from_cells(cells: list[str]) -> dict[str, str] | None:
+    joined = " | ".join(cells)
+    skip_tokens = ("目标描述", "语法项目", "结构形式", "举例", "实词", "虚词", "句子成分", "复句")
+    if any(token == joined or joined.startswith(f"{token} |") for token in skip_tokens):
+        return None
+    if "语法项目表" in joined or not joined.strip(" |"):
+        return None
+
+    useful = [cell for cell in cells if cell and cell not in {"实词", "虚词", "句子成分、句型和句类", "复句"}]
+    if len(useful) < 2:
+        return None
+    if len(useful) == 2:
+        title, example = useful
+        structure = ""
+    else:
+        title = useful[0]
+        structure = useful[1]
+        example = "；".join(useful[2:])
+    title = re.sub(r"\s+", " ", title).strip(" ：:")
+    structure = re.sub(r"\s+", " ", structure).strip(" ：:")
+    example = re.sub(r"\s+", " ", example).strip(" ：:")
+    if not title or len(title) > 180:
+        return None
+    return {"title": title, "structure": structure, "example": example}
 
 
 def parse_source(path: Path, index_name: str) -> list[Chunk]:
@@ -514,6 +614,61 @@ def progress_log(enabled: bool, message: str) -> None:
         print(message, flush=True)
 
 
+def visible_proxy_env_names() -> list[str]:
+    return [
+        name
+        for name in ("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "https_proxy", "http_proxy", "all_proxy")
+        if os.getenv(name)
+    ]
+
+
+def embed_chunk_batch(
+    batch: list[Chunk],
+    *,
+    log_progress: bool = False,
+    depth: int = 0,
+) -> list[list[float]]:
+    texts = [chunk.content for chunk in batch]
+    for attempt in range(1, MAX_EMBED_RETRIES + 1):
+        try:
+            return embed_texts(texts)
+        except Exception as exc:
+            if len(batch) > 1:
+                midpoint = len(batch) // 2
+                progress_log(
+                    log_progress,
+                    f"      batch failed on attempt {attempt}; splitting "
+                    f"{len(batch)} chunks into {midpoint}+{len(batch) - midpoint}: {exc}",
+                )
+                return [
+                    *embed_chunk_batch(batch[:midpoint], log_progress=log_progress, depth=depth + 1),
+                    *embed_chunk_batch(batch[midpoint:], log_progress=log_progress, depth=depth + 1),
+                ]
+            if attempt < MAX_EMBED_RETRIES:
+                sleep_seconds = attempt * 2
+                progress_log(
+                    log_progress,
+                    f"      single chunk embedding failed on attempt {attempt}; "
+                    f"retrying in {sleep_seconds}s: {exc}",
+                )
+                time.sleep(sleep_seconds)
+                continue
+
+            proxy_names = visible_proxy_env_names()
+            proxy_hint = (
+                f" Detected proxy env vars: {', '.join(proxy_names)}."
+                if proxy_names
+                else " No proxy env vars detected."
+            )
+            raise RuntimeError(
+                "GCP embedding request failed even for a single chunk. "
+                "This is usually a network/proxy/TLS issue rather than an indexing logic issue."
+                f"{proxy_hint} Original error: {exc}"
+            ) from exc
+
+    raise RuntimeError("Unexpected embedding retry state.")
+
+
 def embed_missing_chunks(
     chunks: list[Chunk],
     *,
@@ -528,10 +683,47 @@ def embed_missing_chunks(
             log_progress,
             f"    embedding batch {start + 1}-{start + len(batch)} / {total}",
         )
-        embeddings = embed_texts([chunk.content for chunk in batch])
+        embeddings = embed_chunk_batch(batch, log_progress=log_progress)
         for chunk, embedding in zip(batch, embeddings, strict=True):
             embeddings_by_hash[chunk.content_hash] = embedding
     return embeddings_by_hash
+
+
+def upsert_chunk_embeddings(
+    connection: sqlite3.Connection,
+    chunks: list[Chunk],
+    embeddings_by_hash: dict[str, list[float]],
+    *,
+    embedding_provider: str,
+    embedding_model: str,
+    created_at: str,
+) -> None:
+    for chunk in chunks:
+        connection.execute(
+            """
+            INSERT OR REPLACE INTO knowledge_chunks (
+                id, index_name, source, source_file, chunk_type, heading, content,
+                content_hash, metadata_json, embedding_provider, embedding_model,
+                embedding_json, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                chunk.id,
+                chunk.index_name,
+                chunk.source,
+                chunk.source_file,
+                chunk.chunk_type,
+                chunk.heading,
+                chunk.content,
+                chunk.content_hash,
+                json.dumps(chunk.metadata, ensure_ascii=False, sort_keys=True),
+                embedding_provider,
+                embedding_model,
+                json.dumps(embeddings_by_hash[chunk.content_hash]),
+                created_at,
+            ),
+        )
 
 
 def store_source_chunks(
@@ -579,6 +771,23 @@ def store_source_chunks(
             return 0
 
         hashes = [chunk.content_hash for chunk in chunks]
+        if force:
+            connection.execute(
+                """
+                DELETE FROM knowledge_chunks
+                WHERE source = ? AND embedding_provider = ? AND embedding_model = ?
+                """,
+                (source, embedding_provider, embedding_model),
+            )
+            connection.execute(
+                """
+                DELETE FROM knowledge_sources
+                WHERE source = ? AND embedding_provider = ? AND embedding_model = ?
+                """,
+                (source, embedding_provider, embedding_model),
+            )
+            connection.commit()
+
         cache = {} if force else fetch_embedding_cache(connection, hashes, embedding_model)
         missing_chunks = [chunk for chunk in chunks if chunk.content_hash not in cache]
         progress_log(
@@ -587,41 +796,55 @@ def store_source_chunks(
             f"missing={len(missing_chunks)}",
         )
         if missing_chunks:
-            cache.update(
-                embed_missing_chunks(
-                    missing_chunks,
-                    log_progress=log_progress,
+            total_missing = len(missing_chunks)
+            for start in range(0, total_missing, DEFAULT_EMBED_BATCH_SIZE):
+                batch = missing_chunks[start : start + DEFAULT_EMBED_BATCH_SIZE]
+                progress_log(
+                    log_progress,
+                    f"    embedding batch {start + 1}-{start + len(batch)} / {total_missing}",
                 )
-            )
+                embeddings = embed_chunk_batch(batch, log_progress=log_progress)
+                batch_cache = {
+                    chunk.content_hash: embedding
+                    for chunk, embedding in zip(batch, embeddings, strict=True)
+                }
+                cache.update(batch_cache)
+                upsert_chunk_embeddings(
+                    connection,
+                    batch,
+                    batch_cache,
+                    embedding_provider=embedding_provider,
+                    embedding_model=embedding_model,
+                    created_at=utc_now(),
+                )
+                connection.commit()
+                progress_log(
+                    log_progress,
+                    f"    persisted embedding batch {start + 1}-{start + len(batch)} / {total_missing}",
+                )
 
         now = utc_now()
-        progress_log(log_progress, "    writing chunks to SQLite")
-        connection.execute("DELETE FROM knowledge_chunks WHERE source = ?", (source,))
-        for chunk in chunks:
+        progress_log(log_progress, "    finalizing source metadata in SQLite")
+        upsert_chunk_embeddings(
+            connection,
+            chunks,
+            cache,
+            embedding_provider=embedding_provider,
+            embedding_model=embedding_model,
+            created_at=now,
+        )
+        current_ids = [chunk.id for chunk in chunks]
+        if current_ids:
+            placeholders = ",".join("?" for _ in current_ids)
             connection.execute(
-                """
-                INSERT INTO knowledge_chunks (
-                    id, index_name, source, source_file, chunk_type, heading, content,
-                    content_hash, metadata_json, embedding_provider, embedding_model,
-                    embedding_json, created_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                f"""
+                DELETE FROM knowledge_chunks
+                WHERE source = ?
+                  AND embedding_provider = ?
+                  AND embedding_model = ?
+                  AND id NOT IN ({placeholders})
                 """,
-                (
-                    chunk.id,
-                    chunk.index_name,
-                    chunk.source,
-                    chunk.source_file,
-                    chunk.chunk_type,
-                    chunk.heading,
-                    chunk.content,
-                    chunk.content_hash,
-                    json.dumps(chunk.metadata, ensure_ascii=False, sort_keys=True),
-                    embedding_provider,
-                    embedding_model,
-                    json.dumps(cache[chunk.content_hash]),
-                    now,
-                ),
+                (source, embedding_provider, embedding_model, *current_ids),
             )
         connection.execute(
             """
@@ -676,6 +899,63 @@ def build_indexes(force: bool = False, log_progress: bool = False) -> dict[str, 
     return result
 
 
+def get_active_index_counts() -> dict[str, int]:
+    init_db()
+    embedding_provider = get_embedding_provider()
+    embedding_model = get_embedding_model()
+    with get_connection() as connection:
+        rows = connection.execute(
+            """
+            SELECT index_name, COUNT(*) AS chunk_count
+            FROM knowledge_chunks
+            WHERE embedding_provider = ? AND embedding_model = ?
+            GROUP BY index_name
+            """,
+            (embedding_provider, embedding_model),
+        ).fetchall()
+    return {row["index_name"]: int(row["chunk_count"]) for row in rows}
+
+
+def expected_sources_by_index() -> dict[str, list[str]]:
+    return {
+        "teaching_index": [relative_source(path) for path in TEACHING_FILES],
+        "level_index": [relative_source(path) for path in LEVEL_FILES],
+    }
+
+
+def require_active_indexes(index_names: Sequence[str] = ("teaching_index", "level_index")) -> dict[str, int]:
+    require_knowledge_files()
+    counts = get_active_index_counts()
+    embedding_provider = get_embedding_provider()
+    embedding_model = get_embedding_model()
+    sources_by_index = expected_sources_by_index()
+    with get_connection() as connection:
+        rows = connection.execute(
+            """
+            SELECT source, index_name, chunk_count
+            FROM knowledge_sources
+            WHERE embedding_provider = ? AND embedding_model = ?
+            """,
+            (embedding_provider, embedding_model),
+        ).fetchall()
+    complete_sources = {(row["index_name"], row["source"]) for row in rows if row["chunk_count"] > 0}
+    missing = []
+    for index_name in index_names:
+        expected_sources = sources_by_index[index_name]
+        if counts.get(index_name, 0) == 0 or any(
+            (index_name, source) not in complete_sources for source in expected_sources
+        ):
+            missing.append(index_name)
+    if missing:
+        missing_text = "、".join(missing)
+        raise RuntimeError(
+            f"当前 {embedding_provider}/{embedding_model} 缺少完整 RAG 索引：{missing_text}。"
+            "请先运行 `uv run python scripts/verify_rag_index.py` "
+            "完成 teaching_index 和 level_index 的真实 embedding 构建。"
+        )
+    return counts
+
+
 def cosine_similarity(a: list[float], b: list[float]) -> float:
     if not a or not b or len(a) != len(b):
         return 0.0
@@ -687,9 +967,12 @@ def cosine_similarity(a: list[float], b: list[float]) -> float:
     return dot / (norm_a * norm_b)
 
 
-def search_index(query: str, index_name: str, top_k: int = 3) -> list[dict[str, Any]]:
+def search_index_by_embedding(
+    query_embedding: list[float],
+    index_name: str,
+    top_k: int = 3,
+) -> list[dict[str, Any]]:
     init_db()
-    query_embedding = embed_texts([query])[0]
     embedding_provider = get_embedding_provider()
     embedding_model = get_embedding_model()
     with get_connection() as connection:
@@ -721,3 +1004,8 @@ def search_index(query: str, index_name: str, top_k: int = 3) -> list[dict[str, 
         )
     scored.sort(key=lambda item: item["score"], reverse=True)
     return scored[:top_k]
+
+
+def search_index(query: str, index_name: str, top_k: int = 3) -> list[dict[str, Any]]:
+    query_embedding = embed_texts([query])[0]
+    return search_index_by_embedding(query_embedding, index_name, top_k)

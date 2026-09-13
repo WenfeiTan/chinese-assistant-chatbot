@@ -11,6 +11,7 @@ from typing import Any
 BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = BASE_DIR / "data"
 CHAT_LOG_DIR = BASE_DIR / "chat_logs"
+TRACE_LOG_DIR = CHAT_LOG_DIR / "traces"
 DB_PATH = DATA_DIR / "app.sqlite3"
 
 
@@ -33,6 +34,7 @@ def get_connection() -> sqlite3.Connection:
 def init_db() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     CHAT_LOG_DIR.mkdir(parents=True, exist_ok=True)
+    TRACE_LOG_DIR.mkdir(parents=True, exist_ok=True)
 
     with get_connection() as connection:
         connection.executescript(
@@ -117,6 +119,21 @@ def append_jsonl(record: dict[str, Any], created_at: str | None = None) -> None:
     with log_path.open("a", encoding="utf-8") as file:
         file.write(json.dumps(record, ensure_ascii=False, sort_keys=True))
         file.write("\n")
+
+
+def write_trace(record: dict[str, Any], created_at: str | None = None) -> Path:
+    timestamp = created_at or record.get("created_at") or utc_now()
+    safe_timestamp = timestamp.replace(":", "").replace("-", "")
+    conversation_id = str(record.get("conversation_id") or "unknown")
+    trace_dir = TRACE_LOG_DIR / timestamp[:10]
+    trace_dir.mkdir(parents=True, exist_ok=True)
+    trace_path = trace_dir / f"{conversation_id}_{safe_timestamp}.json"
+    trace_path.write_text(
+        json.dumps(record, ensure_ascii=False, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    append_jsonl({"type": "trace", "path": str(trace_path), **record}, timestamp)
+    return trace_path
 
 
 def ensure_conversation(

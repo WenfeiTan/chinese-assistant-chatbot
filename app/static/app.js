@@ -9,10 +9,41 @@ const history = [];
 function addBubble(role, text = "") {
   const bubble = document.createElement("div");
   bubble.className = `bubble ${role}`;
-  bubble.textContent = text;
+  setBubbleText(bubble, text, role);
   messages.appendChild(bubble);
   messages.scrollTop = messages.scrollHeight;
   return bubble;
+}
+
+function escapeHtml(text) {
+  return text
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
+}
+
+function renderAssistantText(text) {
+  const escaped = escapeHtml(text);
+  return escaped
+    .replace(/\*\*([^*\n][\s\S]*?[^*\n])\*\*/g, "<strong>$1</strong>")
+    .replace(/^\s*(\d+[.．、])\s+/gm, "<br>$1 ")
+    .replace(/\n{3,}/g, "\n\n")
+    .replaceAll("\n", "<br>");
+}
+
+function setBubbleText(bubble, text, role = "assistant") {
+  bubble.dataset.rawText = text;
+  if (role === "assistant") {
+    bubble.innerHTML = renderAssistantText(text);
+  } else {
+    bubble.textContent = text;
+  }
+}
+
+function appendAssistantText(bubble, text) {
+  setBubbleText(bubble, `${bubble.dataset.rawText || ""}${text}`, "assistant");
 }
 
 function parseSseFrames(buffer) {
@@ -65,6 +96,7 @@ form.addEventListener("submit", async (event) => {
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
     let buffer = "";
+    let hasAssistantToken = false;
 
     while (true) {
       const { value, done } = await reader.read();
@@ -78,11 +110,24 @@ form.addEventListener("submit", async (event) => {
         const { event, data } = readFrame(frame);
         if (event === "metadata") {
           conversationId = JSON.parse(data).conversation_id;
+        } else if (event === "status") {
+          const payload = JSON.parse(data);
+          if (!hasAssistantToken) {
+            setBubbleText(assistantBubble, payload.message || "正在处理...");
+            messages.scrollTop = messages.scrollHeight;
+          }
         } else if (event === "token") {
-          assistantBubble.textContent += data;
+          if (!hasAssistantToken) {
+            setBubbleText(assistantBubble, "");
+            hasAssistantToken = true;
+          }
+          appendAssistantText(assistantBubble, JSON.parse(data));
           messages.scrollTop = messages.scrollHeight;
         } else if (event === "done") {
-          history.push({ role: "assistant", content: assistantBubble.textContent });
+          history.push({ role: "assistant", content: assistantBubble.dataset.rawText || "" });
+        } else if (event === "error") {
+          const payload = JSON.parse(data);
+          setBubbleText(assistantBubble, `请求失败：${payload.message}`);
         }
       }
     }

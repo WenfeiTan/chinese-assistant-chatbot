@@ -1,3 +1,59 @@
+# Feature Branch 规划与当前 Demo 状态
+
+## 0. 当前 Demo 实现状态
+
+更新时间：2026-09-13
+
+当前分支：`feature/rag-chat-integration`
+
+当前 demo 已完成一个本地可跑的中文学习聊天闭环：
+
+```text
+网页聊天
+→ FastAPI /api/chat
+→ 保存 user message
+→ analyze problem_type / language_point
+→ 生成 query embedding
+→ 检索 teaching_index top 3
+→ 检索 level_index top 3
+→ 拼接 kernel + workflow + runtime context
+→ 调用 GCP GenAI stream_reply
+→ 后端转换为 SSE
+→ 前端流式渲染
+→ 保存 assistant message、agent_events、完整 trace
+```
+
+已完成：
+
+- `feature/bootstrap-fastapi-chat`：FastAPI、静态聊天页、健康检查、SSE 聊天接口。
+- `feature/sqlite-chat-logs`：SQLite conversations/messages/agent_events，每日 JSONL，完整 trace JSON。
+- `feature/rag-embedding-index`：`teaching_index` / `level_index` 双路 index，GCP embedding，source hash 复用，batch 成功后即时落库。
+- `feature/gcp-model-client`：`embed_texts` 和 `stream_reply` 统一封装 GCP GenAI 调用。
+- `feature/rag-chat-integration`：query embedding、双路 top 3 检索、runtime context、GCP stream 到 SSE。
+- `feature/prompt-workflows`：kernel + workflow prompt 拆分，并调整为默认自然段回答，避免练习册题解口吻。
+- 基础前端渲染：支持流式状态、token 渲染、粗体 Markdown 的安全展示，避免用户看到裸 `**`。
+
+当前知识库和索引状态：
+
+- 教材索引：`知识库min/教材/发展汉语高级阅读1.md`、`知识库min/教材/发展汉语高级阅读1参考答案.md`。
+- 水平边界索引：`HSK4词汇.md`、`HSK5词汇.md`、`HSK语法1-5.md`。
+- 当前实现中，HSK4 词汇每 15 个词一组，HSK5 词汇每 8 个词一组，语法按单个语法项目切分。
+- 最近一次本地索引检查约为 `teaching_index=143`、`level_index=155`，以 `scripts/verify_rag_index.py` 实际输出为准。
+
+当前 debug 入口：
+
+- SQLite：`data/app.sqlite3`
+- 每日 JSONL：`chat_logs/YYYY-MM-DD.jsonl`
+- 完整 trace：`chat_logs/traces/YYYY-MM-DD/{conversation_id}_{timestamp}.json`
+- trace 中记录 analyze、prompt、RAG chunks、model metadata、assistant reply 和前端 event payload。
+
+仍然属于 demo 限制的部分：
+
+- 检索使用 SQLite 全量扫描余弦相似度，没有引入生产向量库。
+- analyze 仍是轻量规则，不是独立 LLM 分类器。
+- 自动化端到端验证依赖本地 GCP key、网络和已构建索引。
+- 当前 focus 是知识性问答和语言点引导，不做练习册答题产品。
+
 ## 1. Feature Branch 规划
 
 建议每个 feature branch 只完成一个可验证切片，避免把 RAG、前端、prompt、数据系统混在一个大分支里。

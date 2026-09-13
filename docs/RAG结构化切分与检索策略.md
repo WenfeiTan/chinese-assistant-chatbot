@@ -40,10 +40,48 @@ RAG chunk 的边界必须优先跟随教材语义结构，而不是字符数。
 ```text
 知识库min/水平表/HSK4词汇.md
 知识库min/水平表/HSK5词汇.md
-知识库min/水平表/HSK语法1-6.md
+知识库min/水平表/HSK语法1-5.md
 ```
 
-本文重点覆盖教材教学范本的结构化切分和联动检索。水平表切分策略见 `docs/最小可行技术实现计划.md`。
+本文重点覆盖教材教学范本的结构化切分和联动检索。当前实现也包含 `level_index` 的结构化切分：HSK4 词汇按 15 个词一组，HSK5 词汇按 8 个词一组，HSK 语法按单个语法项目切分。
+
+### 2.1 当前 level_index 切分策略
+
+`level_index` 的目标不是把词典逐条背诵式塞给模型，而是给回答提供“能力边界”和“可解释范围”。因此当前实现采用更粗的教学分组：
+
+- `HSK4词汇.md`：每 15 个词汇条目生成一个 `vocabulary_group` chunk。
+- `HSK5词汇.md`：每 8 个词汇条目生成一个 `vocabulary_group` chunk。
+- `HSK语法1-5.md`：按表格中的单个语法项目生成一个 `grammar` chunk。
+
+词汇分组 chunk 保留：
+
+```json
+{
+  "index_name": "level_index",
+  "chunk_type": "vocabulary_group",
+  "level": "HSK4",
+  "item_no_start": 1,
+  "item_no_end": 15,
+  "group_no": 1,
+  "group_size": 15,
+  "terms": ["..."]
+}
+```
+
+语法 chunk 保留：
+
+```json
+{
+  "index_name": "level_index",
+  "chunk_type": "grammar",
+  "hsk_level": "4",
+  "grammar_point": "时间状语",
+  "structure": "主语 + 时间 + 动词",
+  "examples": ["..."]
+}
+```
+
+这样做的取舍是：减少过碎 chunk 和 embedding 调用量，同时让检索结果提供足够的同级别词汇/语法边界。后续如果需要更精确的词条 exact lookup，可以在 embedding 检索之外增加关键词查表，不必把每个词都独立 embedding。
 
 ## 3. 教材结构识别
 

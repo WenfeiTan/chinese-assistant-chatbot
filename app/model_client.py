@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import hashlib
-import math
 import os
 from pathlib import Path
 from typing import Any
@@ -11,8 +9,6 @@ EMBEDDING_PROVIDER = "gcp"
 LLM_PROVIDER = "gcp"
 DEFAULT_LLM_MODEL = "gemini-3.8-flash"
 DEFAULT_EMBEDDING_MODEL = "gemini-embedding-2"
-MOCK_EMBEDDING_PROVIDER = "mock"
-MOCK_EMBEDDING_MODEL = "mock-embedding-128"
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DOTENV_PATH = PROJECT_ROOT / ".env"
 
@@ -35,14 +31,10 @@ load_dotenv_if_present()
 
 
 def get_embedding_model() -> str:
-    if is_mock_embeddings_enabled():
-        return MOCK_EMBEDDING_MODEL
     return os.getenv("GCP_EMBEDDING_MODEL", DEFAULT_EMBEDDING_MODEL)
 
 
 def get_embedding_provider() -> str:
-    if is_mock_embeddings_enabled():
-        return MOCK_EMBEDDING_PROVIDER
     return EMBEDDING_PROVIDER
 
 
@@ -52,11 +44,6 @@ def get_llm_model() -> str:
 
 def get_llm_provider() -> str:
     return LLM_PROVIDER
-
-
-def is_mock_embeddings_enabled() -> bool:
-    value = os.getenv("MOCK_EMBEDDINGS", "").strip().lower()
-    return value in {"1", "true", "yes", "on"}
 
 
 def _extract_embedding_values(embedding: Any) -> list[float]:
@@ -110,30 +97,16 @@ def _extract_event_text(event: Any) -> str:
     return ""
 
 
-def _mock_embedding(text: str, dimensions: int = 128) -> list[float]:
-    vector = [0.0] * dimensions
-    for token in text:
-        digest = hashlib.sha256(token.encode("utf-8")).digest()
-        index = int.from_bytes(digest[:4], "big") % dimensions
-        sign = 1.0 if digest[4] % 2 == 0 else -1.0
-        vector[index] += sign
-    norm = math.sqrt(sum(value * value for value in vector)) or 1.0
-    return [value / norm for value in vector]
-
-
 def embed_texts(texts: list[str]) -> list[list[float]]:
     if not texts:
         return []
-
-    if is_mock_embeddings_enabled():
-        return [_mock_embedding(text) for text in texts]
 
     try:
         from google import genai
     except ImportError as exc:
         raise RuntimeError(
             "google-genai is required for real embeddings. "
-            "Install dependencies and configure GEMINI_API_KEY, or set MOCK_EMBEDDINGS=1 for local verification."
+            "Install dependencies and configure GEMINI_API_KEY."
         ) from exc
 
     client = genai.Client()
