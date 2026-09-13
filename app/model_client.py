@@ -8,6 +8,8 @@ from typing import Any
 
 
 EMBEDDING_PROVIDER = "gcp"
+LLM_PROVIDER = "gcp"
+DEFAULT_LLM_MODEL = "gemini-3.8-flash"
 DEFAULT_EMBEDDING_MODEL = "gemini-embedding-2"
 MOCK_EMBEDDING_PROVIDER = "mock"
 MOCK_EMBEDDING_MODEL = "mock-embedding-128"
@@ -44,6 +46,14 @@ def get_embedding_provider() -> str:
     return EMBEDDING_PROVIDER
 
 
+def get_llm_model() -> str:
+    return os.getenv("GCP_LLM_MODEL", DEFAULT_LLM_MODEL)
+
+
+def get_llm_provider() -> str:
+    return LLM_PROVIDER
+
+
 def is_mock_embeddings_enabled() -> bool:
     return os.getenv("MOCK_EMBEDDINGS") == "1"
 
@@ -75,6 +85,28 @@ def _extract_result_embeddings(result: Any) -> list[list[float]]:
         return [_extract_embedding_values(embedding)]
 
     raise RuntimeError("GCP GenAI embedding response did not include embeddings.")
+
+
+def _extract_event_text(event: Any) -> str:
+    delta = getattr(event, "delta", None)
+    if delta is not None:
+        delta_text = getattr(delta, "text", None)
+        if isinstance(delta_text, str) and delta_text:
+            return delta_text
+        if isinstance(delta, dict):
+            delta_text = delta.get("text")
+            if isinstance(delta_text, str) and delta_text:
+                return delta_text
+    for attribute in ("text", "output_text", "delta", "content"):
+        value = getattr(event, attribute, None)
+        if isinstance(value, str) and value:
+            return value
+    if isinstance(event, dict):
+        for key in ("text", "output_text", "delta", "content"):
+            value = event.get(key)
+            if isinstance(value, str) and value:
+                return value
+    return ""
 
 
 def _mock_embedding(text: str, dimensions: int = 128) -> list[float]:
@@ -126,3 +158,24 @@ def embed_texts(texts: list[str]) -> list[list[float]]:
             )
         per_text_embeddings.append(single_embeddings[0])
     return per_text_embeddings
+
+
+def stream_reply(input_text: str) -> Any:
+    try:
+        from google import genai
+    except ImportError as exc:
+        raise RuntimeError(
+            "google-genai is required for real LLM calls. "
+            "Install dependencies and configure GEMINI_API_KEY."
+        ) from exc
+
+    client = genai.Client()
+    stream = client.interactions.create(
+        model=get_llm_model(),
+        input=input_text,
+        stream=True,
+    )
+    for event in stream:
+        text = _extract_event_text(event)
+        if text:
+            yield text
