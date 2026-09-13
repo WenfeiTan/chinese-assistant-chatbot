@@ -35,6 +35,7 @@ OPTION_RE = re.compile(r"^([A-H])[.．、]\s*(.*)")
 INLINE_OPTION_RE = re.compile(r"([A-H])[.．、]?([^A-H]+?)(?=(?:[A-H][.．、]?)|$)")
 ANSWER_RE = re.compile(r"(\d+)[.．、]\s*([^0-9]+?)(?=\s+\d+[.．、]|$)")
 ARTICLE_NUMERALS = "一二三四五六七八九十"
+DEFAULT_EMBED_BATCH_SIZE = 64
 
 
 @dataclass(frozen=True)
@@ -508,11 +509,47 @@ def fetch_embedding_cache(connection: sqlite3.Connection, hashes: list[str], mod
     return {row["content_hash"]: json.loads(row["embedding_json"]) for row in rows}
 
 
-def store_source_chunks(path: Path, index_name: str, chunks: list[Chunk], force: bool = False) -> int:
+def progress_log(enabled: bool, message: str) -> None:
+    if enabled:
+        print(message, flush=True)
+
+
+def embed_missing_chunks(
+    chunks: list[Chunk],
+    *,
+    batch_size: int = DEFAULT_EMBED_BATCH_SIZE,
+    log_progress: bool = False,
+) -> dict[str, list[float]]:
+    embeddings_by_hash: dict[str, list[float]] = {}
+    total = len(chunks)
+    for start in range(0, total, batch_size):
+        batch = chunks[start : start + batch_size]
+        progress_log(
+            log_progress,
+            f"    embedding batch {start + 1}-{start + len(batch)} / {total}",
+        )
+        embeddings = embed_texts([chunk.content for chunk in batch])
+        for chunk, embedding in zip(batch, embeddings, strict=True):
+            embeddings_by_hash[chunk.content_hash] = embedding
+    return embeddings_by_hash
+
+
+def store_source_chunks(
+    path: Path,
+    index_name: str,
+    chunks: list[Chunk],
+    force: bool = False,
+    log_progress: bool = False,
+) -> int:
     source = relative_source(path)
     source_hash = file_hash(path)
     embedding_provider = get_embedding_provider()
     embedding_model = get_embedding_model()
+    progress_log(
+        log_progress,
+        f"[index] {source} -> {len(chunks)} chunks "
+        f"(provider={embedding_provider}, model={embedding_model}, force={force})",
+    )
     with get_connection() as connection:
         existing = connection.execute(
             """
@@ -538,17 +575,27 @@ def store_source_chunks(path: Path, index_name: str, chunks: list[Chunk], force:
             and existing["chunk_count"] == len(chunks)
             and existing_count == len(chunks)
         ):
+            progress_log(log_progress, "    up to date; using cached embeddings")
             return 0
 
         hashes = [chunk.content_hash for chunk in chunks]
         cache = {} if force else fetch_embedding_cache(connection, hashes, embedding_model)
         missing_chunks = [chunk for chunk in chunks if chunk.content_hash not in cache]
+        progress_log(
+            log_progress,
+            f"    cache hits={len(chunks) - len(missing_chunks)} "
+            f"missing={len(missing_chunks)}",
+        )
         if missing_chunks:
-            embeddings = embed_texts([chunk.content for chunk in missing_chunks])
-            for chunk, embedding in zip(missing_chunks, embeddings, strict=True):
-                cache[chunk.content_hash] = embedding
+            cache.update(
+                embed_missing_chunks(
+                    missing_chunks,
+                    log_progress=log_progress,
+                )
+            )
 
         now = utc_now()
+        progress_log(log_progress, "    writing chunks to SQLite")
         connection.execute("DELETE FROM knowledge_chunks WHERE source = ?", (source,))
         for chunk in chunks:
             connection.execute(
@@ -593,17 +640,28 @@ def store_source_chunks(path: Path, index_name: str, chunks: list[Chunk], force:
             """,
             (source, index_name, source_hash, embedding_provider, embedding_model, len(chunks), now),
         )
+        progress_log(log_progress, f"    done; stored {len(chunks)} chunks")
         return len(chunks)
 
 
-def build_indexes(force: bool = False) -> dict[str, Any]:
+def build_indexes(force: bool = False, log_progress: bool = False) -> dict[str, Any]:
     require_knowledge_files()
     init_db()
     result: dict[str, Any] = {"rebuilt_sources": [], "sources": [], "total_chunks": 0}
+    progress_log(log_progress, "[build] starting RAG index build")
     for index_name, paths in (("teaching_index", TEACHING_FILES), ("level_index", LEVEL_FILES)):
+        progress_log(log_progress, f"[build] index={index_name}")
         for path in paths:
+            progress_log(log_progress, f"  parsing {relative_source(path)}")
             chunks = parse_source(path, index_name)
-            rebuilt = store_source_chunks(path, index_name, chunks, force=force)
+            progress_log(log_progress, f"  parsed {len(chunks)} chunks")
+            rebuilt = store_source_chunks(
+                path,
+                index_name,
+                chunks,
+                force=force,
+                log_progress=log_progress,
+            )
             result["total_chunks"] += len(chunks)
             source_summary = {
                 "index_name": index_name,
@@ -614,6 +672,7 @@ def build_indexes(force: bool = False) -> dict[str, Any]:
             result["sources"].append(source_summary)
             if rebuilt > 0:
                 result["rebuilt_sources"].append(source_summary)
+    progress_log(log_progress, f"[build] complete; total_chunks={result['total_chunks']}")
     return result
 
 

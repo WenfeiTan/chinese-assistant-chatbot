@@ -97,6 +97,7 @@ def print_search_results(query: str, top_k: int) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Build and verify the dual RAG embedding indexes.")
     parser.add_argument("--force", action="store_true", help="Rebuild embeddings even when source hashes are unchanged.")
+    parser.add_argument("--quiet", action="store_true", help="Only print summaries and final search results.")
     parser.add_argument("--top-k", type=int, default=3, help="Top-k results per index.")
     parser.add_argument("--query", action="append", help="Query to verify. Can be passed multiple times.")
     parser.add_argument(
@@ -109,7 +110,15 @@ def main() -> None:
     if args.mock_embeddings:
         os.environ["MOCK_EMBEDDINGS"] = "1"
 
-    result = build_indexes(force=args.force)
+    print(
+        "VERIFY RAG INDEX\n"
+        f"provider={get_embedding_provider()} model={get_embedding_model()} "
+        f"force={args.force} mock_arg={args.mock_embeddings} "
+        f"env_MOCK_EMBEDDINGS={os.getenv('MOCK_EMBEDDINGS', '') or '<unset>'}",
+        flush=True,
+    )
+
+    result = build_indexes(force=args.force, log_progress=not args.quiet)
     print("BUILD SUMMARY")
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
