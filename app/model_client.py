@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import math
 import os
+from pathlib import Path
 from typing import Any
 
 
@@ -10,6 +11,25 @@ EMBEDDING_PROVIDER = "gcp"
 DEFAULT_EMBEDDING_MODEL = "gemini-embedding-2"
 MOCK_EMBEDDING_PROVIDER = "mock"
 MOCK_EMBEDDING_MODEL = "mock-embedding-128"
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+DOTENV_PATH = PROJECT_ROOT / ".env"
+
+
+def load_dotenv_if_present(path: Path = DOTENV_PATH) -> None:
+    if not path.is_file():
+        return
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip("'\"")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+load_dotenv_if_present()
 
 
 def get_embedding_model() -> str:
