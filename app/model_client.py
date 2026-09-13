@@ -55,7 +55,8 @@ def get_llm_provider() -> str:
 
 
 def is_mock_embeddings_enabled() -> bool:
-    return os.getenv("MOCK_EMBEDDINGS") == "1"
+    value = os.getenv("MOCK_EMBEDDINGS", "").strip().lower()
+    return value in {"1", "true", "yes", "on"}
 
 
 def _extract_embedding_values(embedding: Any) -> list[float]:
